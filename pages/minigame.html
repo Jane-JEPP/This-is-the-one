@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Chicago Flappy Bird — Fixed</title>
+<style>
+  :root { --canvas-w: 900px; --canvas-h: 600px; }
+  html,body { height:100%; margin:0; display:flex; align-items:center; justify-content:center; background:#10202b; font-family:Arial,system-ui; }
+  #wrap { text-align:center; }
+  canvas { width:var(--canvas-w); height:var(--canvas-h); border-radius:8px; box-shadow:0 8px 28px rgba(0,0,0,0.6); display:block; background: linear-gradient(#8fd1f4,#87CEEB 50%,#bcdff5 100%); cursor:pointer; }
+  #flash { position:fixed; left:0; top:0; right:0; bottom:0; background:white; opacity:0; pointer-events:none; transition:opacity 160ms linear; }
+  #snapshot { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); display:none; border:6px solid #222; border-radius:6px; background:#fff; box-shadow:0 8px 30px rgba(0,0,0,0.6); max-width:90%; max-height:90%; }
+  #hud { width:var(--canvas-w); margin:10px auto 0; display:flex; justify-content:space-between; color:#fff; }
+  .panel { background:rgba(0,0,0,0.45); color:#fff; padding:14px; border-radius:8px; width:var(--canvas-w); margin:14px auto 0; max-width:100%; }
+  button { background:#1E90FF; color:#fff; border:none; padding:8px 12px; border-radius:6px; cursor:pointer; font-weight:600; }
+  small { opacity:0.9; }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <div style="position:relative; display:inline-block;">
+      <canvas id="game" width="900" height="600" aria-label="Chicago Flappy Bird game"></canvas>
+
+      <img id="snapshot" alt="Bird snapshot (game over)">
+
+      <div id="flash"></div>
+
+      <!-- Start / Game over panels -->
+      <div id="startPanel" class="panel" style="text-align:center;">
+        <h2 style="margin:0 0 6px 0;">Chicago Flappy Bird</h2>
+        <p style="margin:0 0 8px 0;">Press <strong>Space</strong> or click/tap to flap. Avoid the skyscrapers.</p>
+        <button id="startBtn">Start Game</button>
+        <p style="margin-top:10px;"><small>Canvas-drawn skyline (no external images). Snapshot captures the canvas background.</small></p>
+      </div>
+
+      <div id="gameOverPanel" class="panel" style="text-align:center; display:none;">
+        <h2 style="margin:0 0 6px 0;">Game Over</h2>
+        <p id="finalScore" style="margin:0 0 8px 0;"></p>
+        <button id="restartBtn">Play Again</button>
+      </div>
+    </div>
+
+    <div id="hud">
+      <div id="score" aria-live="polite" style="font-size:18px;">Score: 0</div>
+      <div style="font-size:14px; color:#cfe9ff;">Controls: Space / Click / Tap</div>
+    </div>
+  </div>
+
+<script>
+/* ==========
+   Config & state
+   ========== */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+let running = false;
+let frame = 0;
+let score = 0;
+let obstacles = [];
+let ended = false;
+let loopStarted = false;
+
+/* Bird */
+const bird = {
+  x: 160,
+  y: H/2,
+  w: 44,
+  h: 34,
+  vy: 0,
+  rotation: 0
+};
+
+/* Physics tuning - stronger bounce */
+const GRAVITY = 0.55;
+const FLAP = -11;   // stronger flap so you don't have to spam
+const MAX_FALL_SPEED = 12;
+
+/* UI elements */
+const flash = document.getElementById('flash');
+const snapshot = document.getElementById('snapshot');
+const startPanel = document.getElementById('startPanel');
+const gameOverPanel = document.getElementById('gameOverPanel');
+const startBtn = document.getElementById('startBtn');
+const restartBtn = document.getElementById('restartBtn');
+const scoreEl = document.getElementById('score');
+const finalScore = document.getElementById('finalScore');
+
+startBtn.addEventListener('click', startGame);
+restartBtn.addEventListener('click', startGame);
+
+/* Prevent page scroll on spacebar and use it for flap; do not start game automatically on space */
+window.addEventListener('keydown', function(e){
+  if (e.code === 'Space') {
+    e.preventDefault(); // prevent page scroll
+    if (running && !ended) flap();
+  }
+});
+
+/* Click/tap to flap */
+canvas.addEventListener('mousedown', function(e){
+  if (running && !ended) flap();
+});
+
+/* Touch support */
+canvas.addEventListener('touchstart', function(e){
+  e.preventDefault();
+  if (running && !ended) flap();
+}, {passive:false});
+
+/* Simple deterministic skyline seed so skyline is stable */
+let skylineSeed = 12345;
+function seededRandom() {
+  skylineSeed = (skylineSeed * 1664525 + 1013904223) % 4294967296;
+  return skylineSeed / 4294967296;
+}
+
+/* ==========
+   Drawing: background, skyline (stable), clouds & sun
+   ========== */
+function drawBackground() {
+  // sky gradient
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0, '#8fd1f4');
+  g.addColorStop(0.5, '#87CEEB');
+  g.addColorStop(1, '#bcdff5');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+
+  // sun (fixed)
+  ctx.beginPath();
+  ctx.fillStyle = '#FFD76E';
+  ctx.arc(W - 110, 80, 34, 0, Math.PI*2);
+  ctx.fill();
+
+  // clouds (drawn at deterministic positions)
+  ctx.fillStyle = 'rgba(255,255,255,0.95)';
+  drawCloud(120,80, 1.0);
+  drawCloud(320,60, 0.9);
+  drawCloud(520,110, 0.8);
+  function drawCloud(cx, cy, scale) {
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, 40*scale, 22*scale, 0, 0, Math.PI*2);
+    ctx.ellipse(cx+26*scale, cy+6*scale, 34*scale, 18*scale, 0, 0, Math.PI*2);
+    ctx.ellipse(cx-28*scale, cy+8*scale, 28*scale, 14*scale, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // ground band
+  ctx.fillStyle = '#1f2b36';
+  ctx.fillRect(0, H - 60, W, 60);
+}
+
+/* Draw skyline once-per-frame but deterministic so it looks stable (no "strobe") */
+function drawSkyline() {
+  // Preserve seed so skyline is same every frame
+  const originalSeed = skylineSeed;
+  skylineSeed = 424242; // fixed start for skyline layout
+  let x = -50;
+  while (x < W + 200) {
+    const bw = 40 + Math.floor(seededRandom()*120);
+    const bh = 80 + Math.floor(seededRandom()*(H - 220));
+    const colors = ['#2E4053','#36454f','#26343e','#2c2f33'];
+    const color = colors[Math.floor(seededRandom()*colors.length)];
+    ctx.fillStyle = color;
+    ctx.fillRect(x, H - 60 - bh, bw, bh);
+
+    // windows
+    drawWindows(x + 6, H - 60 - bh + 8, bw - 12, bh - 16);
+
+    x += bw + Math.floor(seededRandom()*40);
+  }
+
+  // darker central tower
+  ctx.fillStyle = '#0f1720';
+  ctx.fillRect(W/2 - 40, H-60 - 280, 80, 280);
+  ctx.fillRect(W/2 - 28, H-60 - 350, 56, 70);
+
+  skylineSeed = originalSeed;
+  function drawWindows(bx, by, bw, bh) {
+    ctx.fillStyle = '#0f1f2a';
+    ctx.fillRect(bx - 4, by - 4, bw + 8, bh + 8); // frame
+    const cols = Math.max(1, Math.floor(bw / 18));
+    const rows = Math.max(1, Math.floor(bh / 24));
+    const gapX = (bw - cols*8) / (cols + 1);
+    const gapY = (bh - rows*12) / (rows + 1);
+    for (let r=0; r<rows; r++) {
+      for (let c=0; c<cols; c++) {
+        const wx = bx + gapX + c*(8 + gapX);
+        const wy = by + gapY + r*(12 + gapY);
+        if (seededRandom() > 0.6) ctx.fillStyle = '#ffd873';
+        else ctx.fillStyle = '#1b2a33';
+        ctx.fillRect(wx, wy, 8, 12);
+      }
+    }
+  }
+}
+
+/* ==========
+   Bird draw
+   ========== */
+function drawBird(b) {
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  ctx.rotate(b.rotation);
+  // body
+  ctx.fillStyle = '#1E90FF';
+  ctx.beginPath();
+  ctx.ellipse(0, 0, b.w/2, b.h/2, 0, 0, Math.PI*2);
+  ctx.fill();
+  // wing
+  ctx.beginPath();
+  ctx.fillStyle = '#0f76e6';
+  ctx.ellipse(-6, 6, b.w/4, b.h/6, -0.6, 0, Math.PI*2);
+  ctx.fill();
+  // eye
+  ctx.fillStyle = 'white';
+  ctx.beginPath();
+  ctx.arc(9, -6, 6, 0, Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = 'black';
+  ctx.beginPath();
+  ctx.arc(11, -6, 2.2, 0, Math.PI*2);
+  ctx.fill();
+  // beak
+  ctx.fillStyle = '#FFB347';
+  ctx.beginPath();
+  ctx.moveTo(18,0); ctx.lineTo(24,-4); ctx.lineTo(24,4); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+/* ==========
+   Obstacles (Chicago-themed skyscrapers)
+   ========== */
+function createObstacle() {
+  const gap = 150;
+  const minTop = 60;
+  const maxTop = H - gap - 140;
+  const top = minTop + Math.floor(Math.random()*(Math.max(1, maxTop - minTop)));
+  const w = 80 + Math.floor(Math.random()*30);
+  obstacles.push({ x: W + 40, w, top, bottom: top + gap, speed: 3 + Math.random()*0.8, scored:false });
+}
+
+function drawObstacle(o) {
+  // top building
+  ctx.fillStyle = '#2E3B44';
+  ctx.fillRect(o.x, 0, o.w, o.top);
+  // bottom building
+  ctx.fillRect(o.x, o.bottom, o.w, H - o.bottom);
+  // rooftop antenna
+  ctx.fillStyle = '#0f1720';
+  ctx.fillRect(o.x + o.w*0.45, Math.max(0, o.top - 18), o.w*0.12, 18);
+  // windows
+  drawSkyscraperWindows(o.x + 8, 8, o.w - 16, Math.max(20,o.top - 16));
+  drawSkyscraperWindows(o.x + 8, o.bottom + 12, o.w - 16, Math.max(20, H - o.bottom - 24));
+}
+function drawSkyscraperWindows(x, y, w, h) {
+  ctx.save();
+  ctx.fillStyle = '#0b1620';
+  ctx.fillRect(x-4, y-4, w+8, h+8);
+  const cols = Math.max(1, Math.floor(w/18));
+  const rows = Math.max(1, Math.floor(h/22));
+  const gapX = Math.max(4, (w - cols*10)/(cols+1));
+  const gapY = Math.max(4, (h - rows*12)/(rows+1));
+  let yy = y + gapY/2;
+  for (let r=0;r<rows;r++){
+    let xx = x + gapX/2;
+    for (let c=0;c<cols;c++){
+      ctx.fillStyle = (Math.random() > 0.55) ? '#ffd873' : '#0a1a22';
+      ctx.fillRect(xx, yy, 10, 12);
+      xx += 10 + gapX;
+    }
+    yy += 12 + gapY;
+  }
+  ctx.restore();
+}
+
+/* ==========
+   Collision detection
+   ========== */
+function collision(b, o) {
+  const left = b.x - b.w/2;
+  const right = b.x + b.w/2;
+  const top = b.y - b.h/2;
+  const bottom = b.y + b.h/2;
+  if (right > o.x && left < o.x + o.w) {
+    if (top < o.top || bottom > o.bottom) return true;
+  }
+  return false;
+}
+
+/* ==========
+   Input: flap
+   ========== */
+function flap() {
+  bird.vy = FLAP;
+  bird.rotation = -0.5;
+  // rotate back more gently
+  setTimeout(()=> { bird.rotation = 0; }, 140);
+}
+
+/* ==========
+   Game over: flash + snapshot
+   ========== */
+function doGameOver() {
+  if (ended) return;
+  ended = true;
+  running = false;
+
+  // flash
+  flash.style.opacity = '1';
+  setTimeout(()=> {
+    flash.style.opacity = '0';
+    // take snapshot (frozen image)
+    try {
+      const data = canvas.toDataURL('image/png');
+      snapshot.src = data;
+      snapshot.style.display = 'block';
+    } catch (e) {
+      console.error('snapshot failed', e);
+    }
+    // show game over UI
+    finalScore.textContent = `You scored ${score} point${score===1?'':'s'}.`;
+    startPanel.style.display = 'none';
+    gameOverPanel.style.display = 'block';
+  }, 160);
+}
+
+/* ==========
+   Main loop: update and render
+   ========== */
+function resetGame() {
+  frame = 0;
+  score = 0;
+  obstacles = [];
+  ended = false;
+  snapshot.style.display = 'none';
+  startPanel.style.display = 'none';
+  gameOverPanel.style.display = 'none';
+  bird.y = H/2;
+  bird.vy = 0;
+  bird.rotation = 0;
+  scoreEl.textContent = 'Score: 0';
+}
+
+function update() {
+  if (running) {
+    // physics
+    bird.vy += GRAVITY;
+    bird.vy = Math.max(-20, Math.min(MAX_FALL_SPEED, bird.vy));
+    bird.y += bird.vy;
+    bird.rotation = Math.max(-0.8, Math.min(1.0, bird.vy * 0.03));
+  }
+
+  // spawn obstacles
+  if (running && frame % 110 === 0) createObstacle();
+
+  // move obstacles and score
+  obstacles.forEach((o,i) => {
+    if (running) o.x -= o.speed;
+    if (!o.scored && o.x + o.w < bird.x - bird.w/2) { o.scored = true; score++; scoreEl.textContent = `Score: ${score}`; }
+    if (o.x + o.w < -50) obstacles.splice(i,1);
+  });
+
+  // collisions
+  if (running) {
+    if (bird.y - bird.h/2 < 6 || bird.y + bird.h/2 > H - 60) {
+      doGameOver();
+    } else {
+      for (let o of obstacles) {
+        if (collision(bird, o)) { doGameOver(); break; }
+      }
+    }
+  }
+
+  // render
+  render();
+
+  frame++;
+  requestAnimationFrame(update);
+}
+
+function render() {
+  ctx.clearRect(0,0,W,H);
+  drawBackground();
+  drawSkyline();              // stable skyline drawn each frame (deterministic)
+  // obstacles in foreground
+  obstacles.forEach(o => drawObstacle(o));
+  drawBird(bird);
+}
+
+/* ==========
+   Start / control
+   ========== */
+function startGame() {
+  resetGame();
+  running = true;
+  // start loop exactly once
+  if (!loopStarted) {
+    loopStarted = true;
+    requestAnimationFrame(update);
+  }
+}
+
+/* Prevent accidental double-start click behavior on canvas */
+canvas.addEventListener('click', function(e){
+  // if game hasn't started yet, clicking canvas doesn't start — use Start button
+});
+
+/* initial static render so user sees the scene */
+drawBackground();
+drawSkyline();
+drawBird(bird);
+
+/* Accessibility: allow Enter to start */
+window.addEventListener('keydown', function(e){
+  if ((e.code === 'Enter' || e.key === 'Enter') && !running && !ended) {
+    startGame();
+  }
+});
+</script>
+</body>
+</html>
